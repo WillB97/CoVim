@@ -3,10 +3,9 @@
 import re
 import json
 import argparse
+import asyncio
 
-from twisted.internet.protocol import Factory, Protocol
-#from twisted.protocols.basic import LineReceiver
-from twisted.internet import reactor
+from asyncio import Protocol
 
 parser = argparse.ArgumentParser(description='Start a CoVim server.')
 parser.add_argument('-p', '--persist', action='store_true',
@@ -21,11 +20,15 @@ def name_validate(strg, search=re.compile(r'[^0-9a-zA-Z\-\_]').search):
 
 class React(Protocol):
 
-  def __init__(self, factory):
+  def __init__(self, factory, loop):
     self.factory = factory
     self.state = "GETNAME"
+    self.loop = loop
 
-  def dataReceived(self, data):
+  def connection_made(self, transport):
+    self.transport = transport
+
+  def data_received(self, data):
     if self.state == "GETNAME":
       self.handle_GETNAME(data.decode('utf-8'))
     else:
@@ -115,15 +118,15 @@ class React(Protocol):
       update_self = True
     self.user.broadcast_packet(d, update_self)
 
-  def connectionLost(self, reason):
+  def connection_lost(self, reason):
     if hasattr(self, 'user'):
       userManager.rem_user(self.user)
       if userManager.is_empty():
         print('All users disconnected. Shutting down...')
-        reactor.stop()
+        self.loop.stop()
 
 
-class ReactFactory(Factory):
+class ReactFactory():
 
   def __init__(self):
     self.buff = []
@@ -131,11 +134,18 @@ class ReactFactory(Factory):
   def initiate(self, port):
     self.port = port
     print('Now listening on port {port}...'.format(port=port))
-    reactor.listenTCP(port, self)
-    reactor.run()
+    loop = asyncio.get_event_loop()
+    coro = loop.create_server(lambda: React(self, loop), None, port)
+    server = loop.run_until_complete(coro)
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
 
-  def buildProtocol(self, addr):
-    return React(self)
+    # Close the server
+    server.close()
+    loop.run_until_complete(server.wait_closed())
+    loop.close()
 
 
 class Cursor:
@@ -167,7 +177,11 @@ class User:
     #print(obj_json)
     for name, user in userManager.users.items():
       if user.name != self.name or send_to_self:
-        user.protocol.transport.write(obj_json.encode('utf-8'))
+        try:
+          user.protocol.transport.write(obj_json.encode('utf-8'))
+        except Exception as e:
+          print(type(e))
+          print(e)
         #TODO: don't send yourself your own buffer, but del on a copy doesn't work
 
   def update_cursor(self, x, y):
